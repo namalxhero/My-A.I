@@ -18,6 +18,7 @@ import com.k2fsa.sherpa.onnx.SileroVadModelConfig
 import com.k2fsa.sherpa.onnx.Vad
 import com.k2fsa.sherpa.onnx.VadModelConfig
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 class VoiceService : Service() {
@@ -25,6 +26,12 @@ class VoiceService : Service() {
     companion object {
         const val ACTION_STOP = "com.nipuna.voicesentry.STOP"
         private const val CHANNEL = "sentry"
+
+        /** The voice match is never allowed below this, whatever the slider says. */
+        private const val MIN_OWNER_MATCH = 0.58f
+
+        /** A command after the wake word can be at most this many words. */
+        private const val MAX_COMMAND_WORDS = 8
     }
 
     @Volatile private var active = false
@@ -195,13 +202,12 @@ class VoiceService : Service() {
                         }
                     }
 
-                    // 1) Whose voice is it? (cheap) Anyone but the owner is dropped silently.
+                    // 1) Whose voice is it? Anyone but the owner is dropped silently.
+                    //    The bar is the slider value but never below MIN_OWNER_MATCH, and noise never lowers it.
                     VoiceState.status.value = "Verifying voice…"
                     val score = cosine(spk.embed(seg), ref)
-                    // In a noisy room the voice match naturally drops, so the bar is lowered a little (max 10%).
-                    // Unlock keeps its own strict bar and is NOT relaxed.
-                    val relief = ((floor - 0.01f) * 6f).coerceIn(0f, 0.1f)
-                    if (score < prefs.threshold - relief) {
+                    val bar = max(prefs.threshold, MIN_OWNER_MATCH)
+                    if (score < bar) {
                         rejects.addLast(t0)
                         while (rejects.isNotEmpty() && t0 - rejects.first() > 30000) rejects.removeFirst()
                         if (rejects.size >= 6) backoffUntil = t0 + 20000
@@ -219,15 +225,15 @@ class VoiceService : Service() {
                         continue
                     }
 
-                    // 3) Wake word
+                    // 3) Wake word (must be at the start of the sentence)
                     var rest: String? = t
                     if (prefs.requireWake) {
                         rest = null
-                        val wake = norm(prefs.wakeWord)
+                        // Several spellings allowed, separated by commas: "leo, neil, lio"
+                        val wakes = prefs.wakeWord.split(",").map { norm(it) }.filter { it.isNotEmpty() }
                         val now = System.currentTimeMillis()
-                        val idx = findWake(t, wake)
-                        if (idx != null) {
-                            val tail = idx.trim()
+                        val tail = findWake(t, wakes)?.trim()
+                        if (tail != null) {
                             if (tail.isEmpty()) {
                                 awakeUntil = now + 6000
                                 buzz(30)
@@ -241,6 +247,12 @@ class VoiceService : Service() {
                         } else {
                             VoiceState.add(text, "No wake word", score, false)
                         }
+                    }
+
+                    // 4) A command is short. Long sentences are ordinary talk, not commands.
+                    if (rest != null && rest.split(" ").size > MAX_COMMAND_WORDS) {
+                        VoiceState.add(text, "Too long, not a command", score, false)
+                        rest = null
                     }
 
                     if (rest != null) {
@@ -260,16 +272,30 @@ class VoiceService : Service() {
         }
     }
 
-    /** Returns the text after the wake word, or null if the wake word was not heard. */
-    private fun findWake(t: String, wake: String): String? {
-        if (wake.isEmpty()) return t
-        val idx = t.indexOf(wake)
-        if (idx >= 0) return t.substring(idx + wake.length)
-        if (!wake.contains(' ')) {
-            val words = t.split(' ')
-            val tol = if (wake.length >= 6) 2 else 1
-            for (i in words.indices) {
-                if (lev(words[i], wake) <= tol) return words.drop(i + 1).joinToString(" ")
+    /**
+     * Returns the text after the wake word, or null if the wake word was not heard.
+     * The wake word must be within the first 3 words of the sentence.
+     */
+    private fun findWake(t: String, wakes: List<String>): String? {
+        if (wakes.isEmpty()) return t
+        val words = t.split(" ").filter { it.isNotEmpty() }
+
+        // Exact match first (multi-word wake words are fine here).
+        for (w in wakes) {
+            val ww = w.split(" ")
+            for (i in 0..min(2, words.size - ww.size)) {
+                if (words.subList(i, i + ww.size) == ww) {
+                    return words.drop(i + ww.size).joinToString(" ")
+                }
+            }
+        }
+
+        // Then a close match for single-word wake words (small mishearings).
+        for (w in wakes) {
+            if (w.contains(' ')) continue
+            val tol = if (w.length >= 6) 2 else 1
+            for (i in 0 until min(3, words.size)) {
+                if (lev(words[i], w) <= tol) return words.drop(i + 1).joinToString(" ")
             }
         }
         return null
