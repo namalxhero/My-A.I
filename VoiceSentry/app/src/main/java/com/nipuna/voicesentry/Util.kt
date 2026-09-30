@@ -13,28 +13,49 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 object RootShell {
-    /** Runs a command as root. Returns (exitCode, output). */
-    fun run(cmd: String, timeoutMs: Long = 5000): Pair<Int, String> {
-        return try {
-            val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
-            val out = p.inputStream.bufferedReader().readText()
-            if (!p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
-                p.destroy()
-                Pair(-1, out.trim())
-            } else {
-                Pair(p.exitValue(), out.trim())
+    private val SU = listOf(
+        "su",
+        "/system/bin/su",
+        "/system/xbin/su",
+        "/sbin/su",
+        "/debug_ramdisk/su",
+        "/data/adb/ksu/bin/su",
+    )
+
+    /** Runs a script as root. Returns (exitCode, output). exitCode -1 = su missing or timed out. */
+    fun run(cmd: String, timeoutMs: Long = 6000): Pair<Int, String> {
+        var lastErr = "su not found"
+        for (bin in SU) {
+            try {
+                val p = ProcessBuilder(bin).redirectErrorStream(true).start()
+                val sb = StringBuilder()
+                val reader = Thread {
+                    try {
+                        p.inputStream.bufferedReader().forEachLine { sb.appendLine(it) }
+                    } catch (_: Exception) {
+                    }
+                }
+                reader.start()
+                p.outputStream.bufferedWriter().use { w ->
+                    w.write(cmd)
+                    w.write("\nexit \$?\n")
+                }
+                if (!p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                    p.destroy()
+                    return Pair(-1, "su timed out (root prompt pending?)")
+                }
+                reader.join(500)
+                return Pair(p.exitValue(), sb.toString().trim())
+            } catch (e: Exception) {
+                lastErr = e.message ?: "su failed"
             }
-        } catch (e: Exception) {
-            Pair(-1, e.message ?: "su failed")
         }
+        return Pair(-1, lastErr)
     }
 
     /** Starts a root command and does not wait for it. */
     fun fire(cmd: String) {
-        try {
-            ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
-        } catch (_: Exception) {
-        }
+        Thread { run(cmd, 15000) }.start()
     }
 }
 
