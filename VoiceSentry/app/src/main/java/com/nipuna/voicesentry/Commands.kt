@@ -14,6 +14,44 @@ object Commands {
     private fun has(r: String, pattern: String) = Regex(pattern).containsMatchIn(r)
     private fun wantsOff(r: String) = has(r, "\\b(off|disable|stop|close|kill)\\b")
 
+    // "open" and the ways the speech model mishears it.
+    private const val OPEN_WORDS =
+        "open|opened|opens|opening|oven|owen|upon|opan|opun|launch|start|run"
+    private val OPEN_RE = Regex("\\b($OPEN_WORDS)\\b")
+
+    // Words ignored when working out the app name.
+    private val STOP_WORDS = setOf(
+        "the", "my", "app", "application", "please", "now", "a", "an", "to", "up", "and", "for", "me",
+    )
+
+    // Common mishearings from the speech model -> the word we really want.
+    private val ALIASES = listOf(
+        Regex("\\b(an|on|un|in) ?(look|luck|lok|lack|lark|lug)\\b") to "unlock",
+        Regex("\\bunlocked\\b") to "unlock",
+        Regex("\\b(a |the )?(look|luck|lok|lack|lark|lug|locked)\\b") to "lock",
+        Regex("\\b(flash light|flashlite|flash lite)\\b") to "flashlight",
+    )
+
+    // Words the fuzzy matcher is allowed to snap to.
+    private val KEYWORDS = listOf(
+        "unlock", "lock", "wifi", "bluetooth", "torch", "flashlight", "screenshot",
+        "mute", "home", "back", "recent", "pause", "resume", "next", "skip",
+        "previous", "brighter", "dimmer", "louder", "quieter", "airplane", "brightness",
+    )
+
+    private fun fixHearing(r: String): String {
+        var s = r
+        for ((re, to) in ALIASES) s = s.replace(re, to)
+        return s.split(" ").joinToString(" ") { w ->
+            if (w.length < 4) w
+            else {
+                val k = KEYWORDS.minByOrNull { lev(w, it) }!!
+                val tol = if (w.length >= 6) 2 else 1
+                if (w != k && lev(w, k) <= tol) k else w
+            }
+        }
+    }
+
     /** Runs a root script and reports the real result, not a guess. */
     private fun root(cmd: String, okLabel: String, timeoutMs: Long = 6000): Result {
         val (code, out) = RootShell.run(cmd, timeoutMs)
@@ -22,16 +60,19 @@ object Commands {
     }
 
     fun execute(ctx: Context, p: Prefs, raw: String, score: Float): Result {
-        val r = norm(raw)
+        val r0 = norm(raw)
             .replace("wi fi", "wifi").replace("wife i", "wifi").replace("why fi", "wifi")
             .replace("blue tooth", "bluetooth")
-        if (r.isBlank()) return Result("Empty command", false)
+        if (r0.isBlank()) return Result("Empty command", false)
+
+        val wantsOpen = has(r0, OPEN_RE.pattern)
+        // App names are left alone; everything else gets the mishearing fix.
+        val r = if (wantsOpen) r0 else fixHearing(r0)
 
         return when {
             has(r, "\\b(unlock|un lock|open (my |the )?phone|wake up)\\b") -> unlock(ctx, p, score)
 
-            has(r, "^(open|launch|start|run) ") ->
-                openApp(ctx, r.replaceFirst(Regex("^(open|launch|start|run) "), ""))
+            wantsOpen -> openApp(ctx, r)
 
             has(r, "\\b(lock|block|sleep|screen off|turn off (the |my )?screen)\\b") ->
                 root(
@@ -111,29 +152,52 @@ object Commands {
         )
     }
 
+    /** Similarity of two names, ignoring spaces ("tik tok" == "tiktok"). */
     private fun sim(a: String, q: String): Float {
-        if (a == q) return 1f
-        if (q.length >= 3 && (a.startsWith(q) || q.startsWith(a))) return 0.9f
-        if (q.length >= 3 && a.contains(q)) return 0.8f
-        return 1f - lev(a, q).toFloat() / max(a.length, q.length).coerceAtLeast(1)
+        val x = a.replace(" ", "")
+        val y = q.replace(" ", "")
+        if (x.isEmpty() || y.isEmpty()) return 0f
+        if (x == y) return 1f
+        if (x.length >= 3 && y.length >= 3) {
+            if (x.startsWith(y) || y.startsWith(x)) return 0.9f
+            if (x.contains(y)) return 0.8f
+        }
+        return 1f - lev(x, y).toFloat() / max(x.length, y.length)
     }
 
-    private fun openApp(ctx: Context, name: String): Result {
+    private fun openApp(ctx: Context, sentence: String): Result {
         val pm = ctx.packageManager
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val apps = pm.queryIntentActivities(intent, 0).map {
             Triple(norm(it.loadLabel(pm).toString()), it.activityInfo.packageName, it.activityInfo.name)
         }
-        val q = norm(name).removePrefix("the ").removePrefix("my ").removeSuffix(" app").trim()
-        if (q.isEmpty()) return Result("Which app?", false)
+
+        // Everything except the "open" word and filler is the app name, wherever it sits in the sentence.
+        val rest = sentence.replace(OPEN_RE, " ")
+            .replace(Regex("\\b(tick tock|tik tok|tic toc|tick tok)\\b"), "tiktok")
+            .split(" ").filter { it.isNotEmpty() && it !in STOP_WORDS }
+        if (rest.isEmpty()) return Result("Which app?", false)
+
+        // Try every 1 to 3 word phrase from what was said against every app name.
+        val phrases = mutableListOf<String>()
+        for (i in rest.indices) {
+            for (len in 1..3) {
+                if (i + len <= rest.size) phrases.add(rest.subList(i, i + len).joinToString(" "))
+            }
+        }
+
         var best: Triple<String, String, String>? = null
         var bs = 0f
         for (a in apps) {
-            val s = sim(a.first, q)
+            var s = 0f
+            for (ph in phrases) s = max(s, sim(a.first, ph))
+            // The whole app name spelled out somewhere in the sentence counts as a strong match.
+            val cond = a.first.replace(" ", "")
+            if (cond.length >= 3 && rest.joinToString("").contains(cond)) s = max(s, 0.95f)
             if (s > bs) { bs = s; best = a }
         }
         val b = best
-        if (b == null || bs < 0.6f) return Result("No app matching \"$q\"", false)
+        if (b == null || bs < 0.62f) return Result("No app matching \"${rest.joinToString(" ")}\"", false)
 
         val (code, out) = RootShell.run("am start --user 0 -n '${b.second}/${b.third}'")
         if (code == 0 && !out.contains("Error", ignoreCase = true)) return Result("Opened ${b.first}", true)
